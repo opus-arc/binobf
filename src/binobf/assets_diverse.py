@@ -1,0 +1,211 @@
+"""Build-specific data layouts and inverse u32 programs; not encryption.
+
+No per-page key or permutation table is emitted. The executable still contains
+everything needed to read its data: locating and reusing the reader defeats
+confidentiality. This profile changes the work needed by a static extractor.
+
+The payload uses adjacent, fixed-width octal C string literals to avoid one AST
+initializer node per byte. GCC/Clang support the resulting long concatenated
+literal; strictly minimal C99 implementations need not, and -Wpedantic may warn
+about exceeding C99's minimum supported string length. Compile without LTO.
+"""
+import hashlib
+import math
+import random
+import re
+import struct
+
+from .assets import PackedData
+
+_MASK = (1 << 32) - 1
+_OCTAL = tuple(f'\\{i:03o}' for i in range(256))
+
+
+def _literal(data):
+    return '\n'.join('    "' + ''.join(_OCTAL[b] for b in data[i:i + 64]) + '"'
+                     for i in range(0, len(data), 64))
+
+
+def _coprime(rng, n):
+    if n == 1:
+        return 1
+    while True:
+        a = rng.randrange(1, n)
+        if math.gcd(a, n) == 1:
+            return a
+
+
+def _forward(x, q, program):
+    for op, c in program:
+        if op == 'xor':
+            x ^= q ^ c
+        elif op == 'add':
+            x = (x + (q ^ c)) & _MASK
+        elif op == 'mul':
+            x = (x * c) & _MASK
+        elif op == 'rol':
+            x = ((x << c) | (x >> (32 - c))) & _MASK
+        elif op == 'xsr':
+            x ^= x >> c
+        elif op == 'xsl':
+            x = (x ^ (x << c)) & _MASK
+    return x
+
+
+def _inverse(program):
+    lines = []
+    for op, c in reversed(program):
+        if op == 'xor':
+            lines.append(f'x ^= q ^ UINT32_C(0x{c:08x});')
+        elif op == 'add':
+            lines.append(f'x -= q ^ UINT32_C(0x{c:08x});')
+        elif op == 'mul':
+            lines.append(f'x *= UINT32_C(0x{pow(c, -1, 1 << 32):08x});')
+        elif op == 'rol':
+            lines.append(f'x = (x >> {c}u) | (x << {32 - c}u);')
+        else:
+            direction = '>>' if op == 'xsr' else '<<'
+            shift = c
+            while shift < 32:
+                lines.append(f'x ^= x {direction} {shift}u;')
+                shift *= 2
+    return lines
+
+
+def pack_diverse(data, symbol, *, seed, block_size=4096, notice=None):
+    """Return the legacy PackedData interface with an independent data profile.
+
+    All maps and arithmetic constants are compiler input, not secrets. Public
+    statistics report sizes/counts only, never seeds or mapping descriptions.
+    """
+    if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*', symbol) or symbol.startswith('binobf_'):
+        raise ValueError('asset symbol must be a C identifier, starting with a letter and not binobf_')
+    if block_size < 64 or block_size > 65536 or block_size & (block_size - 1):
+        raise ValueError('block size must be a power of two between 64 and 65536')
+    if not data:
+        raise ValueError('empty assets are unsupported')
+    if len(data) > 64 * 1024 * 1024:
+        raise ValueError('assets up to 64 MiB per generated translation unit are supported')
+    rng = random.Random(seed)
+    pages = (len(data) + block_size - 1) // block_size
+    bucket_count = rng.choice((8, 16))
+    words = block_size // 4
+    plans, seen, prefix = [], set(), 0
+    for bucket in range(min(bucket_count, pages)):
+        n = (pages - 1 - bucket) // bucket_count + 1
+        order = ['xor', 'add', 'mul', 'rol', 'xsr', 'xsl']
+        while True:
+            rng.shuffle(order)
+            if tuple(order) not in seen:
+                break
+        seen.add(tuple(order))
+        program = [(op, rng.randrange(1, 32) if op == 'rol' else
+                    rng.choice((5, 7, 9, 13, 16, 17)) if op in ('xsr', 'xsl') else
+                    rng.getrandbits(32) | (1 if op == 'mul' else 0)) for op in order]
+        plans.append({'n': n, 'prefix': prefix, 'pa': _coprime(rng, n),
+                      'pb': rng.randrange(n), 'wa': rng.randrange(words) | 1,
+                      'wb': rng.randrange(words), 'wc': rng.randrange(words),
+                      'qa': rng.getrandbits(32) | 1, 'qb': rng.getrandbits(32) | 1,
+                      'qc': rng.getrandbits(32), 'program': program})
+        prefix += n
+    encoded = bytearray(pages * block_size)
+    for page in range(pages):
+        p = plans[page % bucket_count]
+        physical = p['prefix'] + ((page // bucket_count) * p['pa'] + p['pb']) % p['n']
+        part = data[page * block_size:(page + 1) * block_size]
+        for word in range(words):
+            q = ((page * p['qa']) ^ (word * p['qb']) ^ p['qc']) & _MASK
+            x = _forward(int.from_bytes(part[word * 4:word * 4 + 4], 'little'), q, p['program'])
+            at = (word * p['wa'] + page * p['wb'] + p['wc']) & (words - 1)
+            struct.pack_into('<I', encoded, physical * block_size + at * 4, x)
+    ident = 'd_' + hashlib.sha256(str(seed).encode() + symbol.encode()).hexdigest()[:16]
+    guard = 'BINOBF_' + ident.upper() + '_H'
+    header = f'''/* Generated by binobf. Keep this interface with your application. */
+#ifndef {guard}
+#define {guard}
+#include <stddef.h>
+#ifdef __cplusplus
+extern "C" {{
+#endif
+size_t {symbol}_size(void);
+/* Returns 0 on success, -1 for invalid range/pointer. No allocations. */
+int {symbol}_read(size_t offset, void *output, size_t length);
+#ifdef __cplusplus
+}}
+#endif
+#endif
+'''
+    cases = []
+    for bucket, p in enumerate(plans):
+        c = [f'        case {bucket}u: {{',
+             f'            uint32_t q = ((uint32_t)page * UINT32_C(0x{p["qa"]:08x})) ^',
+             f'                (word * UINT32_C(0x{p["qb"]:08x})) ^ UINT32_C(0x{p["qc"]:08x});',
+             f'            size_t physical = (size_t){p["prefix"]} + (size_t)((((uint64_t)page / {bucket_count}u)',
+             f'                * UINT64_C({p["pa"]}) + UINT64_C({p["pb"]})) % UINT64_C({p["n"]}));',
+             f'            size_t at_word = (size_t)((word * UINT32_C({p["wa"]}) +',
+             f'                (uint32_t)page * UINT32_C({p["wb"]}) + UINT32_C({p["wc"]})) & UINT32_C({words - 1}));',
+             f'            size_t base = physical * (size_t){block_size} + at_word * 4u;',
+             f'            x = (uint32_t){ident}_bytes[base] |',
+             f'                ((uint32_t){ident}_bytes[base+1] << 8u) |',
+             f'                ((uint32_t){ident}_bytes[base+2] << 16u) |',
+             f'                ((uint32_t){ident}_bytes[base+3] << 24u);']
+        c += ['            ' + line for line in _inverse(p['program'])]
+        c += ['            break;', '        }']
+        cases.append('\n'.join(c))
+    notice_decl = notice_use = ''
+    if notice is not None:
+        notice_decl = (f'static const volatile unsigned char {ident}_notice[] =\n' +
+                       _literal(notice.encode('utf-8')) + ';\n')
+        # A string literal already supplies its terminating NUL.
+        if not notice:
+            notice_decl = f'static const volatile unsigned char {ident}_notice[] = "";\n'
+        notice_use = f'    (void){ident}_notice[0];\n'
+    source = f'''/* Generated by binobf diverse-bucket-u32-v1. Reversible obfuscation, not encryption.
+   The reader remains reusable. Compile without LTO. Long concatenated strings
+   require GCC/Clang support beyond the minimum C99 translation limits. */
+#include <stddef.h>
+#include <stdint.h>
+#if defined(__GNUC__) || defined(__clang__)
+# define BNO_NOINLINE __attribute__((noinline))
+#else
+# define BNO_NOINLINE
+#endif
+static const volatile unsigned char {ident}_bytes[] =
+{_literal(encoded)};
+{notice_decl}
+#ifdef __cplusplus
+extern "C" {{
+#endif
+size_t {symbol}_size(void) {{ return (size_t){len(data)}; }}
+BNO_NOINLINE int {symbol}_read(size_t offset, void *output, size_t length) {{
+    unsigned char *dst = (unsigned char *)output;
+    size_t i = 0;
+{notice_use}    if (offset > (size_t){len(data)} || length > (size_t){len(data)} - offset || (length && !output)) return -1;
+    while (i < length) {{
+        size_t at = offset + i;
+        size_t page = at / {block_size}u;
+        uint32_t word = (uint32_t)((at % {block_size}u) / 4u);
+        uint32_t x;
+        switch ((unsigned)page & {bucket_count - 1}u) {{
+{chr(10).join(cases)}
+        default: return -1; /* Unreachable after the range check. */
+        }}
+        size_t within = at % 4u;
+        size_t n = 4u - within;
+        if (n > length - i) n = length - i;
+        for (size_t k = 0; k < n; ++k)
+            dst[i+k] = (unsigned char)(x >> (8u * (unsigned)(within+k)));
+        i += n;
+    }}
+    return 0;
+}}
+#ifdef __cplusplus
+}}
+#endif
+'''
+    return PackedData(source, header, {
+        'input_bytes': len(data), 'stored_bytes': len(encoded), 'pages': pages,
+        'block_size': block_size, 'bucket_count': bucket_count,
+        'active_buckets': len(plans), 'program_operations_per_bucket': 6,
+        'literal_terminator_bytes': 1, 'encoding': 'diverse-bucket-u32-v1',
+        'encryption': False})

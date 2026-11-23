@@ -51,8 +51,16 @@ def _parser():
     data.add_argument('--header',type=Path,help='generated header path (default: output with .h extension)')
     data.add_argument('--symbol',required=True,help='C identifier prefix of the size/read functions')
     data.add_argument('--block-size',type=int,default=4096)
+    data.add_argument('--profile',choices=['legacy','diverse'],default='legacy',
+                      help='legacy page encoding or experimental per-bucket programs; neither is encryption')
     data.add_argument('--notice-ja',action='store_true',help='embed an ordinary Japanese license notice; not an AI security mechanism')
-    for cmd in (protect,virtualize,data):
+    model=sub.add_parser('compile-model',help='compile finite f32 rows and a paired dot kernel; experimental, rebuild required')
+    model.add_argument('input',type=Path)
+    model.add_argument('-o','--output',type=Path,required=True,help='generated .c path')
+    model.add_argument('--header',type=Path,help='private integration header (default: output with .h extension)')
+    model.add_argument('--symbol',required=True,help='C identifier prefix of the prepare/evaluate interface')
+    model.add_argument('--channels',required=True,type=int,help='2..16 finite little-endian f32 values per row')
+    for cmd in (protect,virtualize,data,model):
         cmd.add_argument('--seed',type=_seed,help='reproducible diversification seed; generated securely if omitted')
         cmd.add_argument('--force',action='store_true',help='replace an existing output, never the input')
         cmd.add_argument('--report',type=Path,help='optional private JSON build summary; no decoder maps')
@@ -191,14 +199,34 @@ def _virtualize(args,seed):
 
 def _pack(args,seed):
     from .assets import pack,JAPANESE_NOTICE
+    if args.profile=='diverse':
+        from .assets_diverse import pack_diverse as pack
     header=args.header or args.output.with_suffix('.h')
     _check_output(header,args.input,args.force)
     if header.resolve()==args.output.resolve():
         raise ValueError('C source and header output paths must be different')
-    packed=pack(args.input.read_bytes(),args.symbol,seed=seed,block_size=args.block_size,notice=JAPANESE_NOTICE if args.notice_ja else None)
+    packed=pack(_load_data(args.input),args.symbol,seed=seed,block_size=args.block_size,notice=JAPANESE_NOTICE if args.notice_ja else None)
     _atomic(args.output,packed.source.encode())
     _atomic(header,packed.header.encode())
-    return {'operation':'paged-data',**packed.statistics,'symbol':args.symbol,'notice_language':'ja' if args.notice_ja else None}
+    return {'operation':'paged-data','profile':args.profile,**packed.statistics,'symbol':args.symbol,'notice_language':'ja' if args.notice_ja else None}
+
+
+def _load_data(path):
+    # Bound the read itself, including files that grow after their initial stat.
+    limit=64*1024*1024
+    with path.open('rb') as source:
+        data=source.read(limit+1)
+    if len(data)>limit:
+        raise ValueError('data up to 64 MiB per generated translation unit are supported')
+    return data
+
+
+def _compile_model(args,seed):
+    from .model import compile_model
+    generated=compile_model(_load_data(args.input),args.symbol,args.channels,seed=seed)
+    _atomic(args.output,generated.source.encode())
+    _atomic(args.header,generated.header.encode())
+    return {'operation':'compiled-model',**generated.statistics,'symbol':args.symbol}
 
 
 def main(argv=None):
@@ -218,7 +246,7 @@ def main(argv=None):
                 for warning in info['warnings']: print('  '+warning)
             return 0
         _check_output(args.output,args.input,args.force)
-        if args.command=='pack-data' and args.header is None:
+        if args.command in ('pack-data','compile-model') and args.header is None:
             args.header=args.output.with_suffix('.h')
         auxiliary=[p for p in (args.report,getattr(args,'emit_c',None),getattr(args,'header',None)) if p is not None]
         for path in auxiliary:
@@ -229,6 +257,7 @@ def main(argv=None):
         seed=args.seed if args.seed is not None else secrets.randbits(128)
         if args.command=='protect': report=_protect(args,seed)
         elif args.command=='virtualize': report=_virtualize(args,seed)
+        elif args.command=='compile-model': report=_compile_model(args,seed)
         else: report=_pack(args,seed)
         _report(args.report,report,args.input,args.force)
         print(f"binobf: {report['operation']} -> {args.output}")

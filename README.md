@@ -3,14 +3,18 @@
 binobf is a selective ARM64 binary obfuscation toolkit. It reads compiled
 machine code, diversifies eligible native functions, and can replace isolated
 integer functions with per-function bytecode interpreters. It also packs
-arbitrary binary assets into a shuffled, encoded page representation.
+arbitrary binary assets into a shuffled, encoded page representation. The 0.2
+development branch adds per-bucket data programs and a paired numeric-model
+representation that is consumed directly by a generated dot-product kernel.
 
 The project is application-independent. It contains no piano model, soundbank,
 application-specific rules, or third-party proprietary binaries.
 
-**Version 0.1 is an experimental, deliberately restricted first backend.** It
+**Version 0.2.0-dev is research code, not a new stable protection grade.** It
 provides concrete transformations and correctness checks, not a claim of
 unbreakable encryption, universal executable virtualization, or AI resistance.
+The published 0.1.0 release remains available separately. The new data modes
+require rebuilding the application; they do not wrap an arbitrary released CLI.
 
 [中文说明](README.zh-CN.md)
 
@@ -160,6 +164,98 @@ the representation and should remain a private build intermediate.
 and permitted use. It is an ordinary license notice, not an instruction that can
 control an AI system or prevent disclosure. It does not alter binobf's MIT license.
 
+### Diverse data programs (experimental)
+
+```sh
+binobf pack-data model.bin -o model.packed.c --symbol model --profile diverse
+```
+
+This preserves the `size`/`read` interface and selects eight or sixteen buckets
+per build. Each active bucket has its own reversible unsigned-integer program,
+page permutation and word placement. There is no global per-page key or page-map
+array to copy into an extractor. A decoder written for the legacy representation
+must be adapted, or the application reader can be reused directly.
+
+The generated payload uses adjacent escaped C strings, avoiding one integer
+initializer expression per stored byte. GCC and Clang support the long combined
+literals; a strictly minimal C99 implementation need not. Do not compile these
+translation units with `-Wpedantic -Werror` or LTO. The existing `legacy` profile
+remains the default for compatibility. This is still a reversible reader, and
+the added operations are not free; measure the paths on which it will run.
+
+### Numeric model with a paired consumer (experimental)
+
+```sh
+binobf compile-model matrix.f32 -o matrix.compiled.c --symbol matrix --channels 6
+cc -std=c99 -O2 -fno-lto -c matrix.compiled.c -o matrix.compiled.o
+```
+
+Input consists of finite, little-endian IEEE binary32 values in complete
+row-major rows, with 2–16 columns and at most 64 MiB. The generator permutes
+columns and applies signed power-of-two scales chosen to preserve every stored
+float exactly. It generates the paired weight transformation in a private
+integration header and a native row evaluator. Stored model bytes are unchanged
+in size, apart from the C string terminator; generated support code adds space.
+
+```c
+#include "matrix.compiled.h"
+matrix_prepared prepared;
+/* Prepare once when these weights change, outside the per-row hot loop. */
+if (matrix_prepare(weights, matrix_channels, &prepared) != 0) {
+    /* Reject invalid pointers, count, or non-finite weights. */
+}
+double value;
+if (matrix_evaluate(row, &prepared, &value) != 0) {
+    /* Reject an invalid row or unprepared/wrong-model context. */
+}
+```
+
+`prepare` is static inline so it can be compiled into the real consuming code.
+The evaluator uses the transformed data directly: it exposes no general
+plaintext-byte reader, allocates no memory, and maintains no decoded matrix
+cache. Keep the generated C and header private to the application build, and
+do not compile or ship the original matrix as well. This interface applies to
+row dot products; it does not automatically transform arbitrary DSP algorithms,
+stateful filters, neural networks, or existing machine code.
+
+**This removes a convenient plaintext interface, not the ability to reconstruct
+the model.** The transformation is mathematically reversible. Basis-weight
+queries recover the matrix if the preparation/evaluation path is accessible;
+the stored representation and consuming kernel can be reused together. Context
+tags catch accidental mixups and are not authentication. Signed column
+permutation and dyadic scaling alone are weak against a determined analyst.
+
+Numerical contract: IEEE round-to-nearest, gradual underflow, no fast-math or
+reassociation, and successfully prepared, unmodified contexts. Products of f32
+inputs and f32 weights are exact in the f64 accumulator; column order changes
+summation rounding. For `n` columns, the absolute error against the exact sum is
+bounded by `gamma(n-1) * sum(abs(products))`, where
+`gamma(k) = k * 2^-53 / (1 - k * 2^-53)`. This is not a bit-identical-output
+guarantee or a guarantee of small relative error near cancellation. The generated
+code rejects fast-math builds; runtime floating-point modes remain the caller's
+responsibility.
+
+### Measure data-access cost
+
+```sh
+python3 tools/benchmark_data.py --help
+python3 tools/benchmark_data.py
+python3 tools/benchmark_model.py
+```
+
+The benchmark compares a memcpy control, the legacy reader and the diverse
+reader using separate translation units and both sequential and short random
+reads. Correctness is checked outside the timed region. It reports the host,
+compiler, workload and paired-round results. Ratios apply to those accessors,
+not the application's total CPU time or audio latency. Do not infer performance
+on Apple Silicon from a Linux x86 host result.
+
+The model benchmark compares the generated evaluator with a native f64 dot
+product using the original f32 data and equivalent argument checks. It records
+one-row and full-matrix workloads, summation differences, and cold weight
+preparation separately. CI records both microbenchmarks on Linux and native
+Apple Silicon without using noisy timing ratios as pass/fail thresholds.
+
 ## Supported instruction profile
 
 Both code modes currently require complete, straight-line, two-argument unsigned
@@ -182,12 +278,13 @@ Handwritten assembly with alternate interior entry points is outside the contrac
 
 ```sh
 sh ./build.sh --test-only
-sh ./build.sh --platform macos-arm64 --version 0.1.0
+sh ./build.sh --platform macos-arm64
 ```
 
 Tests cover malformed container rejection, function boundaries, relocation and
 metadata exclusions, generated-C execution against independent integer references,
-asset readback and bounds, reproducible archives, and archive-tamper detection.
+asset readback and bounds, native numeric-model behavior and basis-recovery
+limitations, reproducible archives, and archive-tamper detection.
 macOS CI additionally exercises real ARM64 native and virtualized code, including
 post-link transformation and re-signing. A tagged release is published only after
 these native tests and archive verification succeed.
@@ -198,6 +295,16 @@ private build summary without decoder maps. Standard output does not print the
 seed or generated decoder tables.
 
 ## Scope and limitations
+
+The 0.2 data research has an explicit negative result: in stripped Linux x86-64
+standalone harnesses, the diverse profile removed the tested plaintext
+fingerprints and broke a fixed legacy extractor, but reusing the internal reader
+still recovered a complete 44 MiB corpus exactly (176/176 records). This is why
+the new profile is optional and no stronger confidentiality grade is claimed.
+The model tests also demonstrate numeric matrix recovery through basis-weight
+queries when its preparation/evaluation interface is available. A separate
+stripped-model reverse-analysis trial is incomplete; it is not a passed gate.
+These are data-path experiments, not evidence of a protected whole application.
 
 This release establishes a small, auditable implementation with fail-closed
 boundaries. It is not a drop-in protector for arbitrary C++, PE/x86, fat Mach-O,
