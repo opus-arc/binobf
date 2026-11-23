@@ -16,7 +16,12 @@ NATIVE_MAC = platform.system() == 'Darwin' and platform.machine() == 'arm64'
 
 
 def run(*args):
-    return subprocess.run([str(x) for x in args], cwd=ROOT, check=True, capture_output=True, text=True)
+    command = [str(x) for x in args]
+    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+    if result.returncode:
+        raise AssertionError(f'command failed ({result.returncode}): {command!r}\n'
+                             f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}')
+    return result
 
 
 def cli(*args):
