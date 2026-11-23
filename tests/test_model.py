@@ -23,6 +23,14 @@ def f32_round(value):
     return struct.unpack('<f', struct.pack('<f', value))[0]
 
 
+def run_compiler(command):
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode:
+        raise AssertionError(f'compiler failed ({result.returncode}): {command!r}\n'
+                             f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}')
+    return result
+
+
 class ModelNativeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -62,9 +70,9 @@ class ModelNativeTests(unittest.TestCase):
         wrapper = cls.root / 'wrapper.c'
         wrapper.write_text('\n'.join(wrappers))
         library = cls.root / ('models.dylib' if sys.platform == 'darwin' else 'models.so')
-        subprocess.run([cls.compiler, '-std=c99', '-O2', '-Wall', '-Wextra', '-Werror',
-                        '-fno-fast-math', '-fPIC', '-shared', *map(str, sources), str(wrapper),
-                        '-o', str(library)], check=True, capture_output=True)
+        run_compiler([cls.compiler, '-std=c99', '-O2', '-Wall', '-Wextra', '-Werror',
+                      '-fno-fast-math', '-fPIC', '-shared', *map(str, sources), str(wrapper),
+                      '-o', str(library)])
         cls.native = ctypes.CDLL(str(library))
         for name, channels, rows, context, generated in cls.models:
             prepare = getattr(cls.native, f'wrap{channels}')
@@ -152,9 +160,8 @@ class ModelNativeTests(unittest.TestCase):
                            '  model4_prepared p;\n'
                            '  if (model4_prepare(w, model4_channels, &p)) return -1;\n'
                            '  return model4_evaluate(0, &p, out);\n}\n')
-        subprocess.run([compiler, '-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror',
-                        '-c', str(wrapper), '-o', str(self.root / 'cpp.o')],
-                       check=True, capture_output=True)
+        run_compiler([compiler, '-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror',
+                      '-c', str(wrapper), '-o', str(self.root / 'cpp.o')])
 
 
 class ModelGeneratorTests(unittest.TestCase):
