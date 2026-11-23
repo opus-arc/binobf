@@ -81,6 +81,25 @@ def macho_object(*, data_in_code=False, relocation=False):
                       textoff=textoff, symoff=symoff, stroff=stroff)
 
 
+def macho_pie_with_header_symbol():
+    """Synthetic PIE metadata with ld64's out-of-section header marker."""
+    data, offsets = macho_object()
+    base = 0x100000000
+    strings = b"\0_demo\0__mh_execute_header\0"
+    symoff = offsets["symoff"]
+    stroff = symoff + 32
+    data = data[:symoff] + bytearray(32) + strings
+    struct.pack_into("<I", data, 12, 2)  # MH_EXECUTE
+    struct.pack_into("<I", data, 24, 0x200000)  # MH_PIE
+    struct.pack_into("<QQQQ", data, 32 + 24, base, 4096, 0, len(data))
+    struct.pack_into("<Q", data, offsets["section"] + 32, base + offsets["textoff"])
+    struct.pack_into("<6I", data, offsets["symcommand"], 2, 24, symoff, 2, stroff, len(strings))
+    struct.pack_into("<IBBHQ", data, symoff, 1, 0x0F, 1, 0, base + offsets["textoff"])
+    struct.pack_into("<IBBHQ", data, symoff + 16, 7, 0x0F, 1, 0x10, base)
+    offsets.update(stroff=stroff, header_symbol=symoff + 16, base=base)
+    return data, offsets
+
+
 class BinaryAdversarialTests(unittest.TestCase):
     def assert_not_selectable(self, data):
         with self.assertRaises(BinaryError):
@@ -201,6 +220,44 @@ class BinaryAdversarialTests(unittest.TestCase):
         struct.pack_into("<I", data, m["symoff"], 0xFFFFFFFF)
         with self.assertRaises(BinaryError):
             parse(data)
+
+    def test_macho_pie_header_marker_is_metadata_not_a_function(self):
+        data, offsets = macho_pie_with_header_symbol()
+        image = parse(data)
+        self.assertEqual(image.kind, "executable")
+        self.assertEqual([f.name for f in image.functions], ["_demo"])
+        function, = image.select(["demo"])
+        self.assertEqual(function.code, CODE)
+        self.assertEqual(function.offset, offsets["textoff"])
+        with self.assertRaises(BinaryError):
+            image.select(["__mh_execute_header"])
+
+    def test_macho_header_marker_does_not_admit_malformed_lookalikes(self):
+        for mutation in ("wrong-name", "wrong-value", "local-symbol", "wrong-description",
+                         "wrong-section", "object", "non-pie", "wrong-segment", "wrong-section-name"):
+            data, offsets = macho_pie_with_header_symbol()
+            symoff = offsets["header_symbol"]
+            if mutation == "wrong-name":
+                data[offsets["stroff"] + 7] = ord("x")
+            elif mutation == "wrong-value":
+                struct.pack_into("<Q", data, symoff + 8, offsets["base"] + 4)
+            elif mutation == "local-symbol":
+                data[symoff + 4] = 0x0E
+            elif mutation == "wrong-description":
+                struct.pack_into("<H", data, symoff + 6, 0)
+            elif mutation == "wrong-section":
+                data[symoff + 5] = 2
+            elif mutation == "object":
+                struct.pack_into("<I", data, 12, 1)
+            elif mutation == "non-pie":
+                struct.pack_into("<I", data, 24, 0)
+            elif mutation == "wrong-segment":
+                data[offsets["section"] + 16:offsets["section"] + 32] = b"__DATA".ljust(16, b"\0")
+            else:
+                data[offsets["section"]:offsets["section"] + 16] = b"__data".ljust(16, b"\0")
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(BinaryError):
+                    parse(data)
 
     def test_macho_data_in_code_is_not_selectable(self):
         data, _ = macho_object(data_in_code=True)
