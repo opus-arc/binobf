@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.o
+*.so
+*.dylib
+build/
+dist/
+.DS_Store
