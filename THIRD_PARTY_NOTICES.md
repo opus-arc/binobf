@@ -1,7 +1,7 @@
 # Third-party notices and implementation provenance
 
 The Python frontend, binary readers, AArch64 decoder, VM emitter, paged asset
-encoder, tests and packaging scripts in version 0.1.0 are original code distributed
+encoder, model representation generator, tests and packaging scripts are original code distributed
 under the MIT license in this repository. No third-party obfuscator implementation
 or proprietary application/model data is vendored.
 
@@ -22,9 +22,16 @@ Architecture and format references used when designing the implementation:
   <https://gabi.xinuos.com/elf/>
 - Apple's code signing guidance:
   <https://developer.apple.com/library/archive/technotes/tn2206/>
+- Tigress data encoding design documentation (representation changes and
+  corresponding operations): <https://tigress.wtf/encodeData.html>
+- O-MVLL strings encoding documentation (generated decoding and runtime
+  plaintext limitations): <https://obfuscator.re/omvll/passes/strings-encoding/>
 
 These are references to public specifications and platform documentation. They
 are not endorsements of binobf or evidence of resistance to reverse engineering.
+The 0.2 experiments use these last two documents as design references; no
+Tigress or O-MVLL source code is copied or bundled, and their licenses do not
+license any part of this repository by implication.
 
 The generated VM runtime and resource accessor are also MIT-licensed original
 code. Retain the binobf copyright and MIT notice when redistributing substantial
