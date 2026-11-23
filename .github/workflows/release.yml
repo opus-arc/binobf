@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - name: Test the tagged revision
+        run: sh ./build.sh --test-only
+
+  package-macos:
+    runs-on: macos-15
+    outputs:
+      version: ${{ steps.release_metadata.outputs.version }}
+      tag: ${{ steps.release_metadata.outputs.tag }}
+      sha: ${{ steps.release_metadata.outputs.sha }}
+    env:
+      BINOBF_REQUIRE_NATIVE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - name: Require a native Apple Silicon host
+        run: test "$(uname -m)" = arm64
+      - name: Derive and validate release identity
+        id: release_metadata
+        run: |
+          version=$(python3 -c 'import runpy; from pathlib import Path; print(runpy.run_path("tools/package_release.py")["source_version"](Path.cwd()))')
+          tag="v$version"
+          case "$GITHUB_EVENT_NAME" in
+            push)
+              test "$GITHUB_REF_TYPE" = tag
+              test "$GITHUB_REF_NAME" = "$tag"
+              ;;
+            workflow_dispatch) ;;
+            *) exit 2 ;;
+          esac
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          printf 'version=%s\ntag=%s\nsha=%s\n' "$version" "$tag" "$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+      - name: Build and execute tests from both exact archives
+        env:
+          RELEASE_VERSION: ${{ steps.release_metadata.outputs.version }}
+        run: sh ./build.sh --platform macos-arm64 --version "$RELEASE_VERSION"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verified-macos-arm64
+          path: |
+            dist/binobf-v*-macos-arm64.tar.gz
+            dist/binobf-v*-macos-arm64.zip
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: [test-linux, package-macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: verified-macos-arm64
+          path: dist
+      - name: Verify downloaded release bytes
+        working-directory: dist
+        run: sha256sum --check SHA256SUMS
+      - name: Publish the tested artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ needs.package-macos.outputs.version }}
+          RELEASE_TAG: ${{ needs.package-macos.outputs.tag }}
+          RELEASE_SHA: ${{ needs.package-macos.outputs.sha }}
+        run: |
+          cat > release-notes.md <<'NOTES'
+          ## binobf — experimental preview
+
+          Source-inclusive Python 3 distribution for Apple Silicon macOS.
+          The archives were built and exercised on a native macOS arm64 runner.
+
+          - Selective native ARM64 register transformation.
+          - Private bytecode generation for the supported pure `u32x2` object subset.
+          - Generic asset packing with generated C accessors.
+
+          Extract the archive, then run `./bin/binobf --help`. VM object generation
+          additionally requires the macOS command-line developer tools.
+
+          This release does not claim Developer ID signing or notarization.
+          Check `SHA256SUMS` before use and read the included README for supported
+          instruction sets, ABI restrictions, and protection limits.
+          NOTES
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            tag_options=(--verify-tag)
+          else
+            # Do not let an existing tag silently override --target on a manual run.
+            if gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --silent >/dev/null 2>&1; then
+              printf '%s\n' "Manual release requires an absent tag; $RELEASE_TAG already exists." >&2
+              exit 1
+            fi
+            tag_options=(--target "$RELEASE_SHA")
+          fi
+          gh release create "$RELEASE_TAG" \
+            "dist/binobf-$RELEASE_TAG-macos-arm64.tar.gz" \
+            "dist/binobf-$RELEASE_TAG-macos-arm64.zip" \
+            dist/SHA256SUMS "${tag_options[@]}" --prerelease --title "binobf $RELEASE_VERSION" \
+            --notes-file release-notes.md
