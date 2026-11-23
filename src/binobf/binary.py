@@ -134,6 +134,9 @@ def _macho(data):
             _extent(data, fileoff, filesize, 'segment file extent')
             if segname.rstrip(b'\0') == b'__TEXT':
                 text_base = vmaddr
+            header_base = (vmaddr if segname.rstrip(b'\0') == b'__TEXT'
+                           and fileoff == 0 and filesize >= 32 + cmdbytes
+                           and vmsize >= 32 + cmdbytes else None)
             for j in range(count):
                 s = _unpack('<16s16sQQIIIIIIII', data, pos + 72 + 80*j, 'Mach-O section')
                 name, segment, addr, length, off, align, reloff, nreloc, sf, _, _, _ = s
@@ -152,7 +155,8 @@ def _macho(data):
                 if align > 31:
                     raise BinaryError('invalid section alignment')
                 sections.append(dict(name=name, segment=segment, address=addr, size=length, offset=off,
-                                     reloc=nreloc, reloff=reloff, flags=sf, zero=zerofill))
+                                     reloc=nreloc, reloff=reloff, flags=sf, zero=zerofill,
+                                     header_base=header_base))
         elif cmd == 2:
             if size != 24 or symtab is not None:
                 raise BinaryError('invalid or repeated symbol table command')
@@ -217,6 +221,17 @@ def _macho(data):
             if not 1 <= sec <= len(sections):
                 raise BinaryError('symbol references an invalid section')
             s = sections[sec-1]
+            # ld64's PIE header marker is N_EXT|N_SECT despite pointing to the
+            # Mach-O header before (__TEXT,__text). It is metadata, not code.
+            # Keep this exception tied to the canonical type, flags and actual
+            # header-bearing segment; ordinary out-of-section symbols fail.
+            # See LLVM llvm-objdump/MachODump.cpp and ld64 LinkEditClassic.hpp.
+            if (filetype == 2 and flags & 0x200000 and name == '__mh_execute_header'
+                    and typ == 0x0f and desc == 0x10 and sec == 1
+                    and s['name'] == '__text' and s['segment'] == '__TEXT'
+                    and s['flags'] & 0x80000400 and s['header_base'] is not None
+                    and value == s['header_base'] and value < s['address']):
+                continue
             if not s['address'] <= value <= s['address'] + s['size']:
                 raise BinaryError('symbol outside its section')
             symbols.append((sec, value, name, bool(typ & 1), desc))
