@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - name: Require Apple Silicon on the macOS job
+        if: runner.os == 'macOS'
+        run: |
+          test "$(uname -m)" = arm64
+          echo 'BINOBF_REQUIRE_NATIVE=1' >> "$GITHUB_ENV"
+      - name: Test and verify both packaged formats
+        run: sh ./build.sh
+
