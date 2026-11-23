@@ -177,6 +177,11 @@ typedef struct {{ uint64_t opaque_tag; double opaque_state[{channels}]; }} {symb
 #ifdef __cplusplus
 extern "C" {{
 #endif
+/* The self-contained implementation also embeds this private header, where
+   preparation need not be called. Clang diagnoses unused main-file helpers. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((unused))
+#endif
 static inline int {symbol}_prepare(const float *weights, size_t count, {symbol}_prepared *prepared) {{
     double checked[{channels}];
     {symbol}_prepared next;
