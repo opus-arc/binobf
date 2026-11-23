@@ -27,4 +27,15 @@ jobs:
           echo 'BINOBF_REQUIRE_NATIVE=1' >> "$GITHUB_ENV"
       - name: Test and verify both packaged formats
         run: sh ./build.sh
+      - name: Record native microbenchmarks without performance thresholds
+        run: |
+          mkdir -p build
+          python3 tools/benchmark_data.py --rounds 5 --warmups 1 --output build/data-benchmark.json
+          python3 tools/benchmark_model.py --rounds 5 --calls 2000000 --output build/model-benchmark.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-microbenchmarks-${{ matrix.os }}
+          path: build/*-benchmark.json
+          if-no-files-found: error
+          retention-days: 14
 
